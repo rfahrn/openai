@@ -1,4 +1,4 @@
-# usage: python updating_excel.py -i Pipline.xlsx -o updated_data.xlsx -r 10 (rows)
+# usage: updating_excel.py -i "C:\Users\FahRe\Desktop\openai\Input\Pipeline.xlsx" -o "C:\Users\FahRe\Desktop\openai\Outputs\updated_data_new.xlsx" -r 10 updated_data_new.xlsx" -r 10 
 import argparse
 import json
 import re
