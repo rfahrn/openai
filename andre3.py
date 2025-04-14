@@ -2,193 +2,145 @@
 import argparse
 import json
 import re
-import requests
-import pandas as pd
-import time
+import logging
 import yaml
-import os
-from typing import List, Dict, Optional
+import openai
+import pandas as pd
 
-def robust_extract_json(response_text: str) -> Optional[dict]:
-    """
-    Enhanced JSON extraction with multiple fallback strategies and debug logging
-    """
-    # Remove chain-of-thought markers
-    cleaned_text = "\n".join(
-        line for line in response_text.splitlines() 
-        if not line.strip().startswith(("<think>", "//", "#"))
-    )
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-    # Strategy 1: Extract JSON code block
-    code_block_match = re.search(r"```(?:json)?\s*({[\s\S]+?})\s*```", cleaned_text)
+JSON_BLOCK_REGEX = re.compile(r"```(?:json)?\s*([\s\S]+?)\s*```", re.MULTILINE)
+
+def robust_extract_json(response_text):
+    code_block_match = JSON_BLOCK_REGEX.search(response_text)
     if code_block_match:
-        try:
-            return json.loads(code_block_match.group(1).strip())
-        except json.JSONDecodeError as e:
-            print(f"Code block JSON error: {e}")
-
-    # Strategy 2: Try parsing entire cleaned text
-    try:
-        return json.loads(cleaned_text)
-    except json.JSONDecodeError as e:
-        pass
-
-    # Strategy 3: Find deepest JSON structure
-    json_candidates = re.findall(r'{(?:[^{}]|(?R))*}', cleaned_text)
-    for candidate in reversed(json_candidates):
+        candidate = code_block_match.group(1)
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
-            continue
-
-    print("JSON extraction failed. Raw response:")
-    print(cleaned_text[:500] + "...")  # Show first 500 chars for debugging
+            pass
+    start = response_text.find("{")
+    end = response_text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = response_text[start:end+1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
     return None
 
-def search_pipeline(api_key: str, num_rows: int, offset: int = 0) -> Optional[List[Dict]]:
+def search_pipeline(max_rows):
     """
-    Improved API call with structured JSON format enforcement
+    Uses the OpenAI API to search for FDA pipeline data and returns a JSON array.
     """
-    system_message = """You are a pharmaceutical data expert. Return ONLY JSON with this structure:
-{
-  "results": [
-    {
-      "Indikation": "...",
-      "Wirkstoff": "...",
-      "Brandname": "...",
-      "Produkteigenschaften": "...",
-      "Applikationsformen": "...",
-      "Lagerungsbedingungen": "...",
-      "spezielle Patientengruppen": "...", 
-      "Informationen für Ärzte, Apotheken und Patienten": "...",
-      "Wirkmechanismus": "...",
-      "Kontraindikationen": "...",
-      "Nebenwirkungen": "...",
-      "Interaktionen": "...",
-      "Schulungshinweise": "...",
-      "zugelassene Konkurrenzprodukte": "...",
-      "Website": "..."
-    }
-  ]
-}"""
-
-    user_message = f"""Search FDA decisions expected in 2025. Return exactly {num_rows} results starting from index {offset}.
-Include only verified data from official sources (FDA, manufacturers, clinicaltrials.gov). 
-Ensure complete fields and valid JSON format."""
-
-    payload = {
-        "model": "sonar-deep-research",
-        "temperature": 0.0,
-        "max_tokens": 8000,
-        "response_format": {"type": "json_object"},
-        "web_search_options": {"search_context_size": "high"},
-        "messages": [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message}
-        ]
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
+    system_message = (
+        "You are a highly knowledgeable expert in pharmaceutical pipeline data and FDA approvals. "
+        "Your task is to search the internet using up-to-date, reliable sources (such as official FDA press releases, "
+        "manufacturer announcements, and reputable medical journals) for the latest pipeline data on all molecules for which "
+        "a US FDA decision is expected in 2025 (including those under FDA Priority Review). "
+        "Compile the data into an Excel-style table sorted by indication, active ingredient and expected approval date and add a column called 'information' where to add any interesting findings and add the date in a bracket. "
+        "The table must include the following columns exactly as specified: "
+        "Indikation, Wirkstoff, Brandname, Produkteigenschaften, Applikationsformen (e.g., Pen, Fertigspritze, Filmtablette, Kapsel), "
+        "Lagerungsbedingungen (especially if refrigeration is needed), spezielle Patientengruppen, Informationen für Ärzte, Apotheken und Patienten, "
+        "Wirkmechanismus, Kontraindikationen, Nebenwirkungen, Interaktionen, Schulungshinweise, zugelassene Konkurrenzprodukte, and Website "
+        "(with URLs of the sources used, separated by semicolons). "
+        "If any field cannot be verified, leave it blank. "
+        "Do not include any chain-of-thought or internal reasoning. Return only a JSON array of objects with exactly the specified keys and no additional commentary. "
+        "For example, an entry in the JSON array should look like this:\n\n"
+        "```json\n"
+        "{\n"
+        "  \"Indikation\": \"Cystische Fibrose (CF)\",\n"
+        "  \"Wirkstoff\": \"Vanzacaftor/Tezacaftor/Deutivacaftor\",\n"
+        "  \"Brandname\": \"Alyftrek\",\n"
+        "  \"Produkteigenschaften\": \"Dreifach-Kombinationstherapie (CFTR-Modulatoren) für Patienten ab 6 Jahren\",\n"
+        "  \"Applikationsformen\": \"Orale Tabletten (einmal tägliche Einnahme)\",\n"
+        "  \"Lagerungsbedingungen\": \"Raumtemperatur\",\n"
+        "  \"spezielle Patientengruppen\": \"Zugelassen ab 6 Jahren; in Schwangerschaft nur nach strenger Abwägung\",\n"
+        "  \"information\": \"FDA-Entscheidung am 15. Januar 2025 (FDA Priority Review) (2023-10-01)\",\n"
+        "  \"Informationen für Ärzte, Apotheken und Patienten\": \"Vor Therapiebeginn sollte ein Gentest die CFTR-Mutation bestätigen; Leberwerte sollten überwacht werden.\",\n"
+        "  \"Wirkmechanismus\": \"Verbessert Menge und Funktion des CFTR-Proteins – Vanzacaftor und Tezacaftor fördern den Transport defekter CFTR-Proteine, während Deutivacaftor die Öffnungszeit des Kanals verlängert.\",\n"
+        "  \"Kontraindikationen\": \"Schwere Leberinsuffizienz\",\n"
+        "  \"Nebenwirkungen\": \"Kopfschmerzen, Atemwegsinfekte, Diarrhoe, erhöhte Leberenzymwerte\",\n"
+        "  \"Interaktionen\": \"Starke CYP3A-Induktoren (z.B. Rifampicin) können die Wirksamkeit vermindern; Grapefruitsaft meiden.\",\n"
+        "  \"Schulungshinweise\": \"Regelmäßige Kontrolle und Patientenschulung notwendig.\",\n"
+        "  \"zugelassene Konkurrenzprodukte\": \"Trikafta\",\n"
+        "  \"Website\": \"https://www.fda.gov; https://www.drugs.com\"\n"
+        "}\n"
+        "```"
+    )
+    user_message = (
+        f"Please search the internet and compile a complete list of all molecules for which a US FDA decision is expected in 2025 "
+        f"(including FDA Priority Review). Sort the results by indication and expected approval date, and return only the first {max_rows} rows. "
+        "Ensure that all required columns (Indikation, Wirkstoff, Brandname, Produkteigenschaften, Applikationsformen, Lagerungsbedingungen, "
+        "spezielle Patientengruppen, Informationen für Ärzte, Apotheken und Patienten, Wirkmechanismus, Kontraindikationen, Nebenwirkungen, "
+        "Interaktionen, Schulungshinweise, zugelassene Konkurrenzprodukte, Website) are present. "
+        "Return only the JSON array with no extra text or reasoning."
+    )
 
     try:
-        response = requests.post(
-            "https://api.perplexity.ai/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=30
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.0,
+            max_tokens=1500,
         )
-        response.raise_for_status()
-    except requests.RequestException as e:
-        print(f"API request failed: {str(e)}")
+    except Exception as e:
+        logging.error(f"OpenAI API error: {e}")
         return None
 
-    try:
-        response_data = response.json()
-        content = response_data['choices'][0]['message']['content']
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        print(f"Response parsing failed: {str(e)}")
-        return None
-
-    json_data = robust_extract_json(content)
-    if not json_data or "results" not in json_data:
-        print("Invalid JSON structure received")
-        return None
-
-    return json_data["results"]
-
-def iterative_search_pipeline(api_key: str, max_rows: int) -> List[Dict]:
-    """
-    Batch retrieval with deduplication and rate limiting
-    """
-    results = []
-    offset = 0
-    batch_size = min(5, max_rows)  # Perplexity's recommended max batch size
+    raw_reply = response.choices[0].message.content
+    logging.info("Received API reply; extracting JSON...")
+    result = robust_extract_json(raw_reply)
     
-    while len(results) < max_rows:
-        print(f"Fetching {batch_size} rows (total {len(results)}/{max_rows})...")
-        
-        batch = search_pipeline(api_key, batch_size, offset)
-        if not batch:
-            print("No data received, stopping search")
-            break
-            
-        # Deduplicate based on key fields
-        unique_entries = []
-        for entry in batch:
-            key = (entry.get("Indikation"), entry.get("Wirkstoff"), entry.get("Brandname"))
-            if not any((e["Indikation"], e["Wirkstoff"], e["Brandname"]) == key for e in results):
-                unique_entries.append(entry)
-                
-        results.extend(unique_entries)
-        offset += len(batch)
-        
-        if len(batch) < batch_size:
-            print("Reached end of available data")
-            break
-            
-        time.sleep(1.2)  # Respect rate limits (5 RPM = 1 every 12s)
-        
-    return results[:max_rows]
+    if result is None:
+        logging.error("Could not extract valid JSON; please verify the API response format.")
+    return result
 
 def main():
     parser = argparse.ArgumentParser(
-        description="FDA Pipeline Data Fetcher",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Search for FDA pipeline data (decisions expected in 2025) using the OpenAI API and output an Excel table."
     )
     parser.add_argument("-o", "--output", required=True,
-                        help="Output Excel file path")
-    parser.add_argument("-r", "--rows", type=int, default=1,
-                        help="Number of rows to retrieve")
-    parser.add_argument("-s", "--sheet", default="FDA Pipeline",
-                        help="Excel sheet name")
+                        help="Path to the output Excel file (e.g., updated_pipeline.xlsx)")
+    parser.add_argument("-r", "--rows", type=int, default=2,
+                        help="Maximum number of rows to return (default: 2)")
+    parser.add_argument("-s", "--sheet", default="Pipeline Data",
+                        help="Name of the Excel sheet (default: 'Pipeline Data')")
     args = parser.parse_args()
 
-    # Load API key
     try:
-        with open("config.yaml") as f:
-            config = yaml.safe_load(f)
-            api_key = config["Perplexity"]
+        with open("config.yaml", "r") as file:
+            config = yaml.safe_load(file)
     except Exception as e:
-        print(f"Config error: {str(e)}")
+        logging.error(f"Error reading config.yaml: {e}")
         return
 
-    print(f"Starting FDA pipeline search for {args.rows} rows...")
-    data = iterative_search_pipeline(api_key, args.rows)
-    
-    if not data:
-        print("No data retrieved")
-        return
-        
     try:
-        df = pd.DataFrame(data)
-        df.to_excel(args.output, sheet_name=args.sheet, index=False)
-        print(f"Successfully saved {len(data)} rows to {args.output}")
+        openai.api_key = config["OPENAI"]
+    except KeyError:
+        logging.error("OpenAI API key not found in config.yaml under the key 'OpenAI'.")
+        return
+
+    logging.info(f"Searching for FDA pipeline data (max {args.rows} rows)...")
+    pipeline_data = search_pipeline(args.rows)
+    if pipeline_data is None:
+        logging.error("No data returned from the search.")
+        return
+
+    try:
+        df = pd.DataFrame(pipeline_data)
     except Exception as e:
-        print(f"Excel export failed: {str(e)}")
+        logging.error(f"Error converting JSON to DataFrame: {e}")
+        return
+
+    try:
+        df.to_excel(args.output, sheet_name=args.sheet, index=False)
+        logging.info(f"Pipeline data saved to {args.output} (sheet: '{args.sheet}').")
+    except Exception as e:
+        logging.error(f"Error writing Excel file: {e}")
 
 if __name__ == "__main__":
     main()

@@ -124,7 +124,7 @@ def main():
     )
     parser.add_argument("-o", "--output", required=True,
                         help="Path to the output Excel file (e.g., updated_pipeline.xlsx)")
-    parser.add_argument("-r", "--rows", type=int, default=1,
+    parser.add_argument("-r", "--rows", type=int, default=2,
                         help="Maximum number of rows to return (default: 10)")
     parser.add_argument("-s", "--sheet", default="Pipeline Data",
                         help="Name of the Excel sheet (default: 'Pipeline Data')")
